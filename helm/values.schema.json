@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Values of the market-data chart",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "replicaCount", "service", "metrics", "existingSecret", "env", "runtime", "resources", "probes", "networkPolicy", "smokeTest"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "service": {
+      "type": "object",
+      "description": "port: the public API and the health probes. market-data has no internal port.",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "GET /metrics is served on this port, never on service.port (the template refuses equal ports).",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "The prometheus.io/* annotations are set by the chart from metrics.port; they cannot be set here.",
+      "propertyNames": { "not": { "pattern": "^prometheus\\.io/" } },
+      "additionalProperties": { "type": "string" }
+    },
+    "existingSecret": { "type": "string", "minLength": 1 },
+    "env": {
+      "type": "object",
+      "description": "Non-secret startup settings only. Secrets belong in the Secret named by existingSecret; PORT and RUNTIME_CONFIG_FILE are rendered by the chart; the runtime keys have their own block; APP_ENV=local is for a run on a developer machine, which a cluster must never use (it replaces the database and NATS with memory).",
+      "required": ["NATS_URL", "AUTH_JWKS_URL", "AUTH_ISSUER", "AUTH_AUDIENCE"],
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "not": {
+          "enum": [
+            "DATABASE_URL",
+            "PORT",
+            "METRICS_PORT",
+            "RUNTIME_CONFIG_FILE",
+            "LOG_LEVEL",
+            "HISTORY_MAX_POINTS",
+            "HISTORY_ENABLED"
+          ]
+        }
+      },
+      "properties": {
+        "APP_ENV": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$", "not": { "const": "local" } },
+        "NATS_URL": { "type": "string", "pattern": "^(nats|tls)://", "description": "nats:// or tls://, as src/config.ts accepts" },
+        "DATABASE_POOL_MAX": { "type": "string", "pattern": "^([1-9]|[1-4][0-9]|50)$", "description": "1 to 50, as src/config.ts accepts" },
+        "SHUTDOWN_DELAY_MS": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,3}|1[0-4][0-9]{3}|15000)$", "description": "0 to 15000, as src/config.ts accepts" },
+        "RUNTIME_CONFIG_POLL_MS": { "type": "string", "pattern": "^([1-9][0-9]{3}|[1-9][0-9]{4,5}|[12][0-9]{6}|3[0-5][0-9]{5}|3600000)$", "description": "1000 to 3600000, as src/config.ts accepts" },
+        "GRAPHQL_INTROSPECTION": { "type": "string", "enum": ["true", "false"], "description": "Whether __schema and __type are answered; false outside a local run" },
+        "GRAPHQL_MAX_DEPTH": { "type": "string", "pattern": "^([1-9]|10)$", "description": "1 to 10 levels of nested fields, as src/config.ts accepts" },
+        "GRAPHQL_MAX_COMPLEXITY": { "type": "string", "pattern": "^(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,4}|100000)$", "description": "10 to 100000, as src/config.ts accepts" }
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "runtime": {
+      "type": "object",
+      "description": "The keys the service applies while it runs (ADR-037); rendered into the ConfigMap <release>-runtime, whose change does not restart the Pods. Values are strings.",
+      "additionalProperties": false,
+      "properties": {
+        "LOG_LEVEL": { "type": "string", "enum": ["fatal", "error", "warn", "info", "debug", "trace", "silent"] },
+        "HISTORY_MAX_POINTS": { "type": "string", "pattern": "^(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,3}|10000)$", "description": "10 to 10000 buckets, as src/config.ts accepts" },
+        "HISTORY_ENABLED": { "type": "string", "enum": ["true", "false"] }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "description": "The memory limit is bounded because the projection rebuild and the backfill run as a second Node process inside the container (heap capped at 96 MB) and share it with the server: at least 384Mi, and a request of at least 128Mi. The schema does not compare the request with the limit; Kubernetes refuses a request above the limit.",
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "required": ["memory"],
+          "properties": {
+            "memory": { "type": "string", "pattern": "^(1(2[89]|[3-9][0-9])|[2-9][0-9]{2}|[1-9][0-9]{3,})Mi$|^[1-9][0-9]*Gi$", "description": "128Mi or more (Mi or Gi)" }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": ["memory"],
+          "properties": {
+            "memory": { "type": "string", "pattern": "^(38[4-9]|39[0-9]|[4-9][0-9]{2}|[1-9][0-9]{3,})Mi$|^[1-9][0-9]*Gi$", "description": "384Mi or more (Mi or Gi)" }
+          }
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "gatewayNamespaceLabels", "gatewayPodLabels", "metrics", "egress"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "gatewayNamespaceLabels": { "$ref": "#/definitions/labels" },
+        "gatewayPodLabels": { "$ref": "#/definitions/labels" },
+        "metrics": {
+          "type": "object",
+          "description": "The namespace of Prometheus, admitted on the metrics port only.",
+          "additionalProperties": false,
+          "required": ["namespace"],
+          "properties": { "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" } }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["postgres", "nats", "keycloak", "dnsNamespaceLabels"],
+          "properties": {
+            "postgres": { "$ref": "#/definitions/destinationWithPort" },
+            "nats": { "$ref": "#/definitions/destinationWithPort" },
+            "keycloak": { "$ref": "#/definitions/destinationWithPort" },
+            "dnsNamespaceLabels": { "$ref": "#/definitions/labels" }
+          }
+        }
+      }
+    },
+    "smokeTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": { "image": { "type": "string", "minLength": 1 } }
+    }
+  },
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Keep it below periodSeconds. The kubelet default is 1." },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" }
+    },
+    "destinationWithPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["podLabels", "port"],
+      "properties": {
+        "podLabels": { "$ref": "#/definitions/labels" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    }
+  }
+}

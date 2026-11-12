@@ -1,0 +1,16 @@
+{{- if eq (int .Values.metrics.port) (int .Values.service.port) }}
+{{- fail "metrics.port must differ from service.port: the API port never serves /metrics" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "market-data.fullname" . }}
+  labels:
+    {{- include "market-data.labels" . | nindent 4 }}
+data:
+  PORT: {{ .Values.service.port | quote }}
+  METRICS_PORT: {{ .Values.metrics.port | quote }}
+  RUNTIME_CONFIG_FILE: {{ include "market-data.runtimeFile" . | quote }}
+  {{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

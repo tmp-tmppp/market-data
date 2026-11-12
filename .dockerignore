@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+dist
+coverage
+reports
+helm
+tests
+contracts/*
+!contracts/graphql
+compose.yaml
+Dockerfile
+.dockerignore
+.gitignore
+.env
+*.md

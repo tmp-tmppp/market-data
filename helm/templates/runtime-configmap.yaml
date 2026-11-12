@@ -1,0 +1,16 @@
+# The runtime configuration file (ADR-037). The Deployment mounts this ConfigMap as a directory and the service reads
+# runtime.env again every RUNTIME_CONFIG_POLL_MS, so a change here takes effect without restarting a Pod. That is why
+# this ConfigMap is deliberately NOT part of the Deployment's checksum annotation, unlike the environment ConfigMap.
+# Lines are KEY=value; only the keys of the "runtime" values block exist.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "market-data.runtimeConfigMap" . }}
+  labels:
+    {{- include "market-data.labels" . | nindent 4 }}
+data:
+  runtime.env: |
+    # Applied by the service while it runs; a key that is missing keeps the service's default.
+    {{- range $key, $value := .Values.runtime }}
+    {{ $key }}={{ $value }}
+    {{- end }}

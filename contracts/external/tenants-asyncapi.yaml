@@ -1,0 +1,255 @@
+asyncapi: 3.0.0
+info:
+  title: Chance tenants events
+  version: 0.1.0
+  description: |
+    Integration events published by the tenants service to NATS JetStream. The service consumes no events.
+
+    - Format: CloudEvents 1.0, structured JSON mode. The message body is the whole CloudEvent.
+    - Stream `TENANTS`: subjects `chance.tenants.>`, file storage, limits retention, 30 days by default
+      (`STREAM_MAX_AGE_DAYS`, the same in every service, so a consumer started later still reads older events), duplicate
+      window 2 minutes. The NATS message header `Nats-Msg-Id` carries the event `id`.
+    - Subject of a message: `chance.tenants.<Event>.<tenantId>`.
+    - Delivery is at least once and the events of one tenant keep their order: consumers deduplicate
+      by the event `id`, take the tenant from `tenantid` and ignore fields they do not know.
+    - Events carry ids, never the names or e-mails of people. The tenant's name and slug are
+      organization data and appear in TenantCreated.
+    - A user may belong to several tenants, one membership each with its own role. A membership is identified by
+      `tenantid` together with `data.userId`, never by the user id alone: `subject` (`member/<userId>`) is unique
+      only inside the tenant that `tenantid` names. A join of a user to a further tenant is a MemberJoined event of
+      that tenant and changes nothing in the user's other tenants.
+defaultContentType: application/json
+servers:
+  nats:
+    host: nats:4222
+    protocol: nats
+    description: NATS server with JetStream, reached by its Kubernetes service name (localhost:4222 in local runs)
+
+channels:
+  tenantCreated:
+    address: chance.tenants.TenantCreated.{tenantId}
+    description: A tenant was created
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      TenantCreated:
+        $ref: '#/components/messages/TenantCreated'
+  memberJoined:
+    address: chance.tenants.MemberJoined.{tenantId}
+    description: A user joined a tenant, with an invite code or through a share link
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      MemberJoined:
+        $ref: '#/components/messages/MemberJoined'
+  memberRoleChanged:
+    address: chance.tenants.MemberRoleChanged.{tenantId}
+    description: The role of a member changed
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      MemberRoleChanged:
+        $ref: '#/components/messages/MemberRoleChanged'
+
+operations:
+  publishTenantCreated:
+    action: send
+    channel:
+      $ref: '#/channels/tenantCreated'
+    summary: Published in the transaction that creates the tenant
+  publishMemberJoined:
+    action: send
+    channel:
+      $ref: '#/channels/memberJoined'
+    summary: Published in the transaction that adds the membership
+  publishMemberRoleChanged:
+    action: send
+    channel:
+      $ref: '#/channels/memberRoleChanged'
+    summary: Published in the transaction that changes the role
+
+components:
+  messages:
+    TenantCreated:
+      name: TenantCreated
+      title: Tenant created
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/TenantCreatedEvent'
+    MemberJoined:
+      name: MemberJoined
+      title: Member joined
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/MemberJoinedEvent'
+    MemberRoleChanged:
+      name: MemberRoleChanged
+      title: Member role changed (in the tenant of `tenantid` only)
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/NatsHeaders'
+      payload:
+        $ref: '#/components/schemas/MemberRoleChangedEvent'
+
+  schemas:
+    NatsHeaders:
+      type: object
+      required: [Nats-Msg-Id]
+      properties:
+        Nats-Msg-Id:
+          type: string
+          format: uuid
+          description: Equals the CloudEvent id; JetStream drops a repeated id inside the duplicate window
+    Role:
+      type: string
+      enum: [trader, tenant-admin]
+    CloudEventEnvelope:
+      type: object
+      description: CloudEvents 1.0 attributes shared by all events of this service
+      required:
+        - specversion
+        - id
+        - source
+        - type
+        - subject
+        - time
+        - datacontenttype
+        - tenantid
+        - correlationid
+        - causationid
+        - data
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          format: uuid
+          description: UUIDv7, the deduplication key
+        source:
+          type: string
+          const: /chance/tenants
+        type:
+          type: string
+          pattern: '^si\.chance\.tenants\.[A-Za-z]+\.v[0-9]+$'
+        subject:
+          type: string
+          description: '`tenant/<tenantId>` or `member/<userId>`'
+        time:
+          type: string
+          format: date-time
+        datacontenttype:
+          type: string
+          const: application/json
+        tenantid:
+          type: string
+          format: uuid
+          description: Tenant context (extension attribute)
+        correlationid:
+          type: string
+          minLength: 1
+          description: Id that ties the events of one business operation together (extension attribute)
+        causationid:
+          type: string
+          minLength: 1
+          description: Id of the request that caused the event (extension attribute)
+        data:
+          type: object
+    TenantCreatedData:
+      type: object
+      additionalProperties: false
+      required: [tenantId, name, slug, createdAt]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    MemberJoinedData:
+      type: object
+      additionalProperties: false
+      required: [tenantId, userId, role, joinedAt]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        joinedAt:
+          type: string
+          format: date-time
+        via:
+          type: string
+          enum: [invite, share_link]
+          description: Optional. How the user joined; absent in events written before this field existed.
+        marketId:
+          type: string
+          format: uuid
+          description: Optional. The market whose share link was used; present only when `via` is `share_link`.
+    MemberRoleChangedData:
+      type: object
+      additionalProperties: false
+      required: [tenantId, userId, oldRole, newRole, changedBy, changedAt]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        oldRole:
+          $ref: '#/components/schemas/Role'
+        newRole:
+          $ref: '#/components/schemas/Role'
+        changedBy:
+          type: string
+          description: Subject of the user who changed the role
+        changedAt:
+          type: string
+          format: date-time
+    TenantCreatedEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.tenants.TenantCreated.v1
+            subject:
+              pattern: '^tenant/'
+            data:
+              $ref: '#/components/schemas/TenantCreatedData'
+    MemberJoinedEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.tenants.MemberJoined.v1
+            subject:
+              pattern: '^member/'
+            data:
+              $ref: '#/components/schemas/MemberJoinedData'
+    MemberRoleChangedEvent:
+      allOf:
+        - $ref: '#/components/schemas/CloudEventEnvelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.tenants.MemberRoleChanged.v1
+            subject:
+              pattern: '^member/'
+            data:
+              $ref: '#/components/schemas/MemberRoleChangedData'

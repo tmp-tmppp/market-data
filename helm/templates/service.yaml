@@ -1,0 +1,16 @@
+# One Service, one port: the public API and the health probes. The gateway routes the prefix /v1/market-data to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "market-data.fullname" . }}
+  labels:
+    {{- include "market-data.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "market-data.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: market-data
+description: "The read side of Chance (CQRS): market lists with current prices and price history per tenant, projected from the events of markets and trading and rebuilt from its own copy of them."
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"

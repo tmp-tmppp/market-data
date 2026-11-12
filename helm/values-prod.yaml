@@ -1,0 +1,26 @@
+# Prod overrides. The pipeline sets the image tag; secrets come from the Secret market-data-env (MARKET_DATA_ENV).
+# Several replicas would be safe (the three durable consumers are shared work queues and the projection rules commute,
+# ADR-058), one is enough for the demo.
+replicaCount: 1
+
+env:
+  APP_ENV: production
+  # The issuer is the identity provider's public address as the browser sees it (https://<public host>/realms/chance).
+  # The pipeline fills it in from the organization variable PUBLIC_HOST (host-values in .github/workflows/ci-cd.yml).
+  # Left empty here on purpose: a deploy without it stops at start with "AUTH_ISSUER is required" instead of
+  # rejecting every token (another "iss" is a 401).
+  AUTH_ISSUER: ""
+
+runtime:
+  LOG_LEVEL: info
+  HISTORY_MAX_POINTS: "1000"
+  HISTORY_ENABLED: "true"
+
+# The projection rebuild (README: "The replay demo") and the one-off backfill run as a second Node process inside the
+# container, so the limit holds the server and that process together; the replay caps its heap at 96 MB.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi

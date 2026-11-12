@@ -1,0 +1,563 @@
+openapi: 3.1.0
+info:
+  title: Chance market-data API
+  version: 0.1.0
+  description: |
+    The read side of Chance (CQRS, plan EP-4): the tenant's markets with their current prices for the market list, the
+    detail header of one market, and the price history for its chart. The data is projected from markets' and
+    trading's events, so it lags behind a trade by a moment (DM-13: 1-2 s); `afterSequence` lets a client wait for its
+    own trade (DM-17).
+
+    - Every endpoint except the health probes needs a bearer JWT issued by the identity provider, with `exp`.
+    - Token contract v2: the tenant is the single alias of the `organization` claim (the tenant id, a UUID); the role is
+      that organization's group: `organization.<alias>.groups` must hold exactly one entry, `/tenant-admin` or
+      `/trader`. `platform-admin` is a realm role (`realm_access.roles`). Anything else fails closed (`403`); a token
+      of more than one organization is `401`.
+    - Roles: traders and tenant admins of the token's tenant read everything here. A `platform-admin` sees no tenant's
+      data and gets `403`, and so does a token without a tenant or without a tenant role. A market of another tenant
+      answers `404`, exactly like a market that does not exist.
+    - **Units.** Every `...Micro` field is an exact integer in micro-units (ADR-055): prices are microcredits per share
+      (`550000` = 0.55 credits per YES share; the NO price is always `1000000` minus the YES price), volumes are
+      microcredits traded (1 credit = 1 000 000).
+    - Errors are RFC 9457 `application/problem+json` with a stable `code`; the problem `type` is
+      `urn:chance:problem:<code with dashes>`. Some problems carry extension members (`lastTradeSequence`, `maxPoints`).
+    - A token that is wrong is answered `401`. Every authenticated endpoint may answer `503` with `Retry-After`
+      (`identity_provider_unavailable`, `tenant_not_ready`, and for the history `history_paused`).
+    - Every API answer carries `Cache-Control: private, no-store` (plan INF-02) and `X-Correlation-Id`.
+    - The gateway routes the prefix `/v1/market-data`; the health paths are not routed by the gateway.
+    - The same three reads are also offered as GraphQL queries at `POST /v1/market-data/graphql` (REQ-17), with the same
+      token rules and the same error codes; that endpoint has its own contract, `graphql/schema.graphql`, and is not
+      described in this file.
+servers:
+  - url: http://localhost:8080
+    description: Local run
+tags:
+  - name: Markets
+    description: The tenant's markets with current prices, and their price history
+  - name: Health
+    description: Kubernetes probes
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/market-data/markets:
+    get:
+      tags: [Markets]
+      operationId: listMarkets
+      summary: The tenant's markets with their current prices
+      description: |
+        Either one page of the market list (newest first: the ids are UUIDv7; `status`, `limit`, `cursor`), or one batch
+        of markets by id (`ids`, DM-12: the portfolio page gets the prices of all its positions in one call, never one
+        call per position). `ids` together with `status`, `limit` or `cursor` is `400`. In a batch, ids that are unknown,
+        of another tenant or not opened yet are left out; the items come in the order of `ids` and `nextCursor` is null.
+        A market appears once its MarketOpened has been processed.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/MarketStatus'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: ids
+          in: query
+          required: false
+          description: Comma-separated market ids (1 to 100, duplicates are collapsed)
+          schema:
+            type: string
+            minLength: 36
+            maxLength: 3800
+          example: 018f3c1e-7a00-7000-8000-000000000101,018f3c1e-7a00-7000-8000-000000000102
+      responses:
+        '200':
+          description: One page of markets
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/market-data/markets/{marketId}:
+    get:
+      tags: [Markets]
+      operationId: getMarket
+      summary: The detail header of one market and its current price
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/AfterSequence'
+      responses:
+        '200':
+          description: The market
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Updating'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/market-data/markets/{marketId}/history:
+    get:
+      tags: [Markets]
+      operationId: getMarketHistory
+      summary: The price history of one market in buckets, for the chart
+      description: |
+        The market's price points (the starting price when it opened, then one per trade) grouped into buckets of
+        `interval`, aligned to the Unix epoch in UTC (a `1h` bucket starts on the hour, a `1d` bucket at 00:00 UTC).
+        Each bucket has the YES price of its first and last point by trade sequence (`open`, `close`), its highest and
+        lowest, the volume and the number of trades. Only buckets with at least one point are returned; carry the last
+        close forward, starting from `previousCloseYesMicro`.
+
+        The range is `[from, to)`: `from` is rounded down to its bucket start, `to` defaults to now. Without `from` it
+        is the newest `HISTORY_MAX_POINTS` buckets (runtime setting, default 1000), never before the market opened. With
+        `from`, the span `to - from` as sent may cover at most `HISTORY_MAX_POINTS` intervals (so "the last 1000
+        minutes" is accepted at any time; rounding `from` down adds at most one partial bucket); a longer span is `400`
+        with `maxPoints`. A `from` or `to` that is not a real time (a leap second such as `23:59:60`) is `400` on that
+        field. Pages hold at most `limit` buckets; `nextCursor` continues the range of the first page: the cursor
+        carries that page's resolved `from` and `to`, so a later page neither moves with the clock nor is checked
+        against `HISTORY_MAX_POINTS` again. Send it with the same `interval`; `from` and `to` may be left out, and when
+        sent must equal the first page's (`to` as returned in the response), otherwise `400` on `cursor`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - name: interval
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [1m, 5m, 15m, 1h, 4h, 1d]
+            default: 1h
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          description: Buckets per page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/AfterSequence'
+      responses:
+        '200':
+          description: One page of the history
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/History'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Updating'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /health/startup:
+    get:
+      tags: [Health]
+      operationId: healthStartup
+      summary: Startup probe
+      description: Answers once the service has applied its migrations and listens.
+      security: []
+      responses:
+        '200':
+          description: Started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: Readiness probe
+      description: |
+        Pings the service's own database only (always ready with in-memory stores); NATS and the identity provider are
+        not checked. Answers 503 from the moment the process gets SIGTERM until it exits.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer (`not_ready`), or the service is shutting down (`shutting_down`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: Liveness probe
+      description: Process only. It never touches the database.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT from the identity provider, verified against its JWKS (issuer, audience and signature; `exp` required).
+        Token contract v2: tenant = the single alias of `organization` (a UUID); role = the organization's only group
+        (`/tenant-admin` or `/trader`); `platform-admin` in `realm_access.roles` is refused.
+
+  headers:
+    CacheControl:
+      description: Always `private, no-store`
+      schema:
+        type: string
+        const: private, no-store
+
+  parameters:
+    MarketId:
+      name: marketId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `nextCursor` of the previous page
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+    AfterSequence:
+      name: afterSequence
+      in: query
+      required: false
+      description: |
+        DM-17 read-your-writes: the `tradeSequence` of the caller's order answer from trading. Until the trade with
+        this sequence is in the read model the answer is `409 updating`; ask again for up to about 2 s, then show
+        "updating".
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 9007199254740991
+
+  responses:
+    BadRequest:
+      description: The request is invalid (code `validation_failed`); `errors` names the fields, `maxPoints` comes with a range that is too large
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The bearer token is missing or invalid
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: The token is a platform admin's, has no single tenant or no tenant role (code `forbidden`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: market-data knows no such market in the caller's tenant, or its MarketOpened has not arrived yet (code `not_found`)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Updating:
+      description: |
+        `afterSequence` names a trade that is not in the read model yet (code `updating`); `lastTradeSequence` is the
+        highest trade sequence it has. Nothing is wrong: ask again shortly.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        Try again after the time in `Retry-After`. The code says why:
+        - `identity_provider_unavailable`: the signing keys cannot be fetched, so the token cannot be checked.
+        - `tenant_not_ready`: the caller's tenant is still being set up in this service.
+        - `history_paused` (history): the runtime setting `HISTORY_ENABLED` pauses the history.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the request is repeated
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    MarketStatus:
+      type: string
+      enum: [open, closed, resolved]
+    Outcome:
+      type: string
+      enum: ['YES', 'NO', 'INVALID']
+      description: |
+        `INVALID` (UC-16): the market could not be answered and trading refunded every stake; the market is resolved
+        but has no final price
+    PriceMicro:
+      type: integer
+      description: A trade price of YES in microcredits per share (0.01 .. 0.99 credits, steps of 0.01)
+      minimum: 10000
+      maximum: 990000
+      multipleOf: 10000
+    Microcredits:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+    Market:
+      type: object
+      additionalProperties: false
+      required:
+        - marketId
+        - question
+        - status
+        - closeTime
+        - openedAt
+        - closedAt
+        - resolvedAt
+        - outcome
+        - startingPriceYesMicro
+        - lastPriceYesMicro
+        - currentPriceYesMicro
+        - volumeMicro
+        - tradeCount
+        - lastTradeSequence
+        - lastTradeAt
+        - version
+        - updatedAt
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        question:
+          type: string
+          minLength: 1
+          maxLength: 200
+        status:
+          $ref: '#/components/schemas/MarketStatus'
+        closeTime:
+          type: string
+          format: date-time
+        openedAt:
+          type: string
+          format: date-time
+        closedAt:
+          type: ['string', 'null']
+          format: date-time
+        resolvedAt:
+          type: ['string', 'null']
+          format: date-time
+        outcome:
+          description: Set exactly when `status` is `resolved`
+          oneOf:
+            - $ref: '#/components/schemas/Outcome'
+            - type: 'null'
+        startingPriceYesMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        lastPriceYesMicro:
+          description: The YES price of the newest trade (highest trade sequence); null before the first trade
+          oneOf:
+            - $ref: '#/components/schemas/PriceMicro'
+            - type: 'null'
+        currentPriceYesMicro:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: |
+            What the list shows: `1000000` (YES) or `0` (NO) once resolved, else the last trade's price, else the
+            starting price. A market resolved `INVALID` has no final price and keeps its last price (else the starting
+            price)
+        volumeMicro:
+          $ref: '#/components/schemas/Microcredits'
+        tradeCount:
+          type: integer
+          minimum: 0
+        lastTradeSequence:
+          type: integer
+          minimum: 0
+          description: The highest trade sequence in the read model (0 without trades)
+        lastTradeAt:
+          type: ['string', 'null']
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+          description: markets' version of the market (DM-04)
+        updatedAt:
+          type: string
+          format: date-time
+    MarketPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Market'
+        nextCursor:
+          type: ['string', 'null']
+    Bucket:
+      type: object
+      additionalProperties: false
+      required: [start, openYesMicro, highYesMicro, lowYesMicro, closeYesMicro, volumeMicro, trades]
+      properties:
+        start:
+          type: string
+          format: date-time
+        openYesMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        highYesMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        lowYesMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        closeYesMicro:
+          $ref: '#/components/schemas/PriceMicro'
+        volumeMicro:
+          $ref: '#/components/schemas/Microcredits'
+        trades:
+          type: integer
+          minimum: 0
+          description: Trades in the bucket (the opening point is not a trade)
+    History:
+      type: object
+      additionalProperties: false
+      required: [marketId, interval, from, to, previousCloseYesMicro, buckets, nextCursor]
+      properties:
+        marketId:
+          type: string
+          format: uuid
+        interval:
+          type: string
+          enum: [1m, 5m, 15m, 1h, 4h, 1d]
+        from:
+          type: string
+          format: date-time
+          description: The range's first bucket start
+        to:
+          type: string
+          format: date-time
+        previousCloseYesMicro:
+          description: The YES price of the latest point before this page's first bucket; null when there is none
+          oneOf:
+            - $ref: '#/components/schemas/PriceMicro'
+            - type: 'null'
+        buckets:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/Bucket'
+        nextCursor:
+          type: ['string', 'null']
+    Problem:
+      type: object
+      description: RFC 9457 problem details; extension members as the codes describe
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          examples: ['urn:chance:problem:tenant-not-ready']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+          examples: [validation_failed, forbidden, not_found, updating, tenant_not_ready, history_paused]
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+        lastTradeSequence:
+          type: integer
+          minimum: 0
+        maxPoints:
+          type: integer
+          minimum: 1
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          examples: [ok]

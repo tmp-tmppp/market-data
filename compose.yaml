@@ -1,0 +1,75 @@
+# Local dependencies of the market-data service: PostgreSQL 18 and NATS with JetStream.
+#   docker compose up -d                  # only the two dependencies (the default)
+#   npm run build
+#   APP_ENV=local DATABASE_URL=postgres://market_data:market_data@localhost:5432/market_data NATS_URL=nats://localhost:4222 npm start
+# or the service itself in a container (the only part that builds the image; the profile keeps it out of the default):
+#   docker compose --profile app up --build
+# market-data calls no other service, so nothing else is needed to start it. Tokens are still verified against
+# AUTH_JWKS_URL (default: a Keycloak of the identity repository on the host, port 8081); the API answers on port 8083 of
+# the host (8080 inside the container, which the other services' local stacks use on the host).
+# With a database, a tenant's schema is created when its TenantCreated event arrives from the tenants service, or on the
+# first market or trade event naming it (start tenants, markets and trading against the same NATS, or publish events
+# by hand); a request of a user for a tenant that is not there yet answers 503 tenant_not_ready. With NATS_URL set the
+# service consumes the streams and has no POST /local/events route: that route exists only for a local run without NATS.
+# The projection rebuild of the REQ-12 demo runs inside the container, see README.md ("The replay demo").
+# Every service's local stack publishes PostgreSQL on 5432 and NATS on 4222: stop one stack before starting another.
+# The password below is a local development value only; real ones live in the Secret market-data-env.
+name: chance-market-data
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: market_data
+      POSTGRES_USER: market_data
+      POSTGRES_PASSWORD: market_data # hooks:allow local development only
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market_data -d market_data"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+
+  market-data:
+    profiles: ["app"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      APP_ENV: local
+      PORT: "8080"
+      DATABASE_URL: postgres://market_data:market_data@postgres:5432/market_data # hooks:allow local development only
+      NATS_URL: nats://nats:4222
+      # The issuer is what the tokens say; the keys are fetched from the host's Keycloak.
+      AUTH_ISSUER: ${AUTH_ISSUER:-http://localhost:8081/realms/chance}
+      AUTH_JWKS_URL: ${AUTH_JWKS_URL:-http://host.docker.internal:8081/realms/chance/protocol/openid-connect/certs}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-chance}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8083:8080"
+    healthcheck:
+      # The image has no curl or wget; Node 24 has fetch.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health/ready').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  postgres-data:
+  nats-data:

@@ -1,0 +1,160 @@
+"""
+The read-only GraphQL view of market-data (plan 6.3, REQ-17, ADR-023), served at POST /v1/market-data/graphql.
+
+This file is the contract: the service builds its schema from it at start, and a contract test compares the schema it
+serves with it. It offers the same three reads as the REST API (contracts/openapi.yaml) over the same use cases, with the
+same token rules, the same errors and the same units:
+
+- Queries only: no mutation and no subscription exist. Every read model change comes from events.
+- The caller's tenant and role come only from the bearer token (token contract v2). No field or argument names a tenant.
+- Every `...Micro` value is an exact integer in micro-units (ADR-055): prices are microcredits per share of YES (the NO
+  price is always 1000000 minus the YES price), volumes are microcredits traded.
+- A failed query field is null with an entry in `errors` whose `extensions.code` is the code of the REST problem
+  (`not_found`, `updating`, `validation_failed`, `history_paused`, `tenant_not_ready`, ...); `extensions.status` is the
+  HTTP status the REST API gives for the same condition. Another field of the same query still answers.
+- Depth and complexity limits and the introspection switch are settings of the service (GRAPHQL_MAX_DEPTH,
+  GRAPHQL_MAX_COMPLEXITY, GRAPHQL_INTROSPECTION); a query over a limit is refused before it runs. The complexity counts a page
+  size from the value of its variable, or from the default declared with the variable when the request sends none. A
+  document that selects a field again under a name its level already has more than 50 times in all (a fixed limit, not a
+  setting) is refused with `complexity_limit_exceeded` too.
+- A variable of the wrong type (a text for an `Int`, an unknown enum value) is `graphql_validation_failed` with status 400,
+  as the same value written in the query is.
+"""
+schema {
+  query: Query
+}
+
+"""
+An instant as RFC 3339 text in UTC with milliseconds, for example `2026-11-11T12:00:00.000Z`. Input accepts any RFC 3339
+date-time (an offset such as `+01:00` is allowed); a text that is no real instant, such as a leap second, is refused
+with `validation_failed` on that argument.
+"""
+scalar DateTime @specifiedBy(url: "https://datatracker.ietf.org/doc/html/rfc3339#section-5.6")
+
+"""
+An integer of the JavaScript safe range (-9007199254740991 to 9007199254740991) as a JSON number. Used for volumes,
+counts and trade sequences, which can pass the 32-bit range of Int.
+"""
+scalar Long
+
+"The lifecycle of a market."
+enum MarketStatus {
+  OPEN
+  CLOSED
+  RESOLVED
+}
+
+"The outcome of a resolved market. INVALID (UC-16): the question could not be answered, every stake was refunded, and the market has no final price."
+enum Outcome {
+  YES
+  NO
+  INVALID
+}
+
+"The width of one price bucket. Buckets are aligned to the Unix epoch in UTC."
+enum HistoryInterval {
+  ONE_MINUTE
+  FIVE_MINUTES
+  FIFTEEN_MINUTES
+  ONE_HOUR
+  FOUR_HOURS
+  ONE_DAY
+}
+
+"A market of the caller's tenant with its current price (REST: schema Market)."
+type Market {
+  marketId: ID!
+  question: String!
+  status: MarketStatus!
+  closeTime: DateTime!
+  openedAt: DateTime!
+  closedAt: DateTime
+  resolvedAt: DateTime
+  "The outcome, set once the market is resolved."
+  outcome: Outcome
+  startingPriceYesMicro: Int!
+  "The price of the last trade; null until the first trade."
+  lastPriceYesMicro: Int
+  "The final price once resolved (1000000 YES, 0 NO), else the last trade's, else the starting price. INVALID has no final price: the last trade's, else the starting price."
+  currentPriceYesMicro: Int!
+  volumeMicro: Long!
+  tradeCount: Long!
+  lastTradeSequence: Long!
+  lastTradeAt: DateTime
+  "The version of the market in markets (DM-04)."
+  version: Int!
+  updatedAt: DateTime!
+}
+
+"Where a page ends. Pass `endCursor` as `after` to read the next page."
+type PageInfo {
+  hasNextPage: Boolean!
+  "Null on the last page. Opaque: never build one."
+  endCursor: String
+}
+
+"A page of markets, newest first."
+type MarketPage {
+  items: [Market!]!
+  pageInfo: PageInfo!
+}
+
+"One bucket of the price history: open, high, low and close by trade sequence."
+type PriceBucket {
+  "The start of the bucket."
+  start: DateTime!
+  openYesMicro: Int!
+  highYesMicro: Int!
+  lowYesMicro: Int!
+  closeYesMicro: Int!
+  volumeMicro: Long!
+  trades: Long!
+}
+
+"The price history of one market: sparse buckets (an empty bucket is not returned), ascending."
+type PriceHistory {
+  marketId: ID!
+  interval: HistoryInterval!
+  "The range of page 1 (`from` is a bucket start); later pages keep it."
+  from: DateTime!
+  to: DateTime!
+  "The YES price of the latest point before the first bucket of this page; null when there is none."
+  previousCloseYesMicro: Int
+  buckets: [PriceBucket!]!
+  pageInfo: PageInfo!
+}
+
+"""
+The three reads. Each needs the bearer token of a trader or a tenant admin of one tenant (token contract v2), and reads
+that tenant only.
+"""
+type Query {
+  """
+  The listed markets of the caller's tenant, newest first. Two shapes, never mixed: a page (`status`, `first`, `after`;
+  `first` is 1 to 100, default 20) or a batch (`ids`: 1 to 100 market ids, answered in the order given, unknown ones left
+  out, no next page). `ids` together with another argument is `validation_failed`.
+  """
+  markets(status: MarketStatus, ids: [ID!], first: Int, after: String): MarketPage
+
+  """
+  One market. `not_found` for an unknown id, another tenant's market and one that is not listed yet. With
+  `afterSequence`, `updating` (with `lastTradeSequence`) until the trade of that sequence is in the read model (DM-17).
+  """
+  market(id: ID!, afterSequence: Long): Market
+
+  """
+  The price history of one market. `interval` defaults to ONE_HOUR, `first` (buckets per page) is 1 to 500, default 100.
+  Without `from` the range is the newest buckets (HISTORY_MAX_POINTS) not before the market opened; `to` defaults to now.
+  `validation_failed` (with `maxPoints`) for a range of more buckets than HISTORY_MAX_POINTS, `history_paused` while the
+  history is paused, `updating` as for `market`.
+  """
+  history(
+    marketId: ID!
+    interval: HistoryInterval
+    from: DateTime
+    to: DateTime
+    first: Int
+    after: String
+    afterSequence: Long
+  ): PriceHistory
+}

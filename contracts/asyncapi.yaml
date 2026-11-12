@@ -1,0 +1,269 @@
+asyncapi: 3.0.0
+info:
+  title: Chance market-data consumed events
+  version: 0.1.0
+  description: |
+    The events market-data consumes from NATS JetStream. market-data publishes nothing (it has no outbox).
+
+    - Format: CloudEvents 1.0, structured JSON mode, as the publishers' contracts define them (copies in
+      contracts/external, origin and hashes in contracts/README.md). This file names only what market-data reads; any
+      other field is ignored, so a new optional field of a publisher never breaks it. market-data is never stricter than
+      a publisher's contract: a value the publisher's schema allows is accepted.
+    - Three durable pull consumers, each named `market-data`: deliver all, explicit ack, ack wait 30 s, max ack pending
+      10, max deliver unlimited, `abort_on_missing_resource` (a stream deleted while consuming makes the consumer
+      reconnect). A failure is negatively acknowledged with a 5 s delay; after 20 failed deliveries the message is
+      parked in shared.parked_events and acknowledged.
+    - Every message of the MARKETS and TRADING consumers with a usable envelope (CloudEvent 1.0, UUID `id` and
+      `tenantid`, a `type` of 1 to 200 characters) is stored in consumed_events, whether this version projects it or
+      not: the four types below are projected; any other type (cause `other_type`), a later version of one of the four
+      (such as `TradeExecuted.v2`) or an event of the four types with an invalid value (cause `unreadable`, logged as a
+      warning) is stored, acknowledged and not projected, so a later version recovers it with a replay (DM-09,
+      ADR-032, ADR-058). A message without a usable envelope cannot be stored in a tenant's schema: it is parked in
+      shared.parked_events at once.
+    - Each event is handled in one transaction of its tenant (the tenant comes from `tenantid`, never from the data
+      alone): the inbox entry (REL-02, DM-06), the raw CloudEvent in consumed_events (the replay source, DM-09,
+      ADR-032), then the projections. The message is acknowledged after the commit.
+    - Retention: MARKETS and TRADING keep 30 days by default (STREAM_MAX_AGE_DAYS of each publisher, 1 to 365). State
+      older than that when market-data is first deployed is loaded once with `npm run backfill` from export files of
+      the publishers (ADR-058).
+    - Order: the projection rules commute. A lifecycle event changes the status only when its `version` is higher than
+      the stored one (DM-04); a trade adds its price point once per `tradeSequence` (DM-10) and sets the last price only
+      when its sequence is the highest. Redeliveries, late events and two consumers therefore converge.
+defaultContentType: application/json
+servers:
+  nats:
+    host: nats:4222
+    protocol: nats
+    description: NATS server with JetStream, reached by its Kubernetes service name (localhost:4222 in local runs)
+
+channels:
+  tenantCreated:
+    address: chance.tenants.TenantCreated.{tenantId}
+    description: |
+      Stream TENANTS, durable consumer `market-data`, filter `chance.tenants.TenantCreated.*`, inbox consumer
+      `tenant-created`: creates and migrates the tenant's schema and registers the tenant.
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      TenantCreated:
+        $ref: '#/components/messages/TenantCreated'
+  marketLifecycle:
+    address: chance.markets.{event}.{tenantId}
+    description: |
+      Stream MARKETS, durable consumer `market-data`, filter `chance.markets.>` (other types are stored in consumed_events
+      and acknowledged, not projected), inbox
+      consumer `market-events`. MarketOpened starts the market's summary and its price series at the starting price;
+      MarketClosed and MarketResolved change its status (the outcome sets the final price: YES 1000000, NO 0; INVALID,
+      UC-16, sets none and the market keeps its last price).
+    parameters:
+      event:
+        enum: [MarketOpened, MarketClosed, MarketResolved]
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      MarketOpened:
+        $ref: '#/components/messages/MarketOpened'
+      MarketClosed:
+        $ref: '#/components/messages/MarketClosed'
+      MarketResolved:
+        $ref: '#/components/messages/MarketResolved'
+  tradeExecuted:
+    address: chance.trading.TradeExecuted.{tenantId}
+    description: |
+      Stream TRADING, durable consumer `market-data`, filter `chance.trading.TradeExecuted.*`, inbox consumer
+      `trade-events`: one price point per trade and the market's current price and volume. MarketSettled is not
+      consumed (MarketResolved already carries the outcome).
+    parameters:
+      tenantId:
+        description: Id of the tenant (UUID)
+    messages:
+      TradeExecuted:
+        $ref: '#/components/messages/TradeExecuted'
+
+operations:
+  receiveTenantCreated:
+    action: receive
+    channel:
+      $ref: '#/channels/tenantCreated'
+  receiveMarketLifecycle:
+    action: receive
+    channel:
+      $ref: '#/channels/marketLifecycle'
+  receiveTradeExecuted:
+    action: receive
+    channel:
+      $ref: '#/channels/tradeExecuted'
+
+components:
+  messages:
+    TenantCreated:
+      name: TenantCreated
+      title: Tenant created (tenants' contract has the full schema)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TenantCreatedEvent'
+    MarketOpened:
+      name: MarketOpened
+      title: Market opened (markets' contract has the full schema)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/MarketOpenedEvent'
+    MarketClosed:
+      name: MarketClosed
+      title: Market closed
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/MarketClosedEvent'
+    MarketResolved:
+      name: MarketResolved
+      title: Market resolved
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/MarketResolvedEvent'
+    TradeExecuted:
+      name: TradeExecuted
+      title: Trade executed (trading's contract has the full schema)
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TradeExecutedEvent'
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The CloudEvent attributes market-data reads. `id` is the inbox and consumed_events key; `tenantid` selects the
+        tenant's schema; `correlationid` is logged. `data.tenantId`, when present, must equal `tenantid`, otherwise the
+        event is unreadable: stored in consumed_events under `tenantid`, not projected.
+      required: [specversion, id, type, tenantid, data]
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+        tenantid:
+          type: string
+          format: uuid
+        correlationid:
+          type: string
+        data:
+          type: object
+    TenantCreatedEvent:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.tenants.TenantCreated.v1
+    MarketOpenedEvent:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.markets.MarketOpened.v1
+            data:
+              type: object
+              required: [marketId, question, closeTime, startingPrice, version, openedAt]
+              properties:
+                marketId:
+                  type: string
+                  format: uuid
+                question:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                  description: Counted in characters (code points, as markets and char_length count them) after trimming; stored trimmed
+                closeTime:
+                  type: string
+                  format: date-time
+                startingPrice:
+                  type: number
+                  minimum: 0.01
+                  maximum: 0.99
+                  description: YES, at most two decimals; stored as startingPriceYesMicro (x 1 000 000, exact)
+                version:
+                  type: integer
+                  minimum: 1
+                openedAt:
+                  type: string
+                  format: date-time
+                  description: The time of the series' opening point (trade sequence 0)
+    MarketClosedEvent:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.markets.MarketClosed.v1
+            data:
+              type: object
+              required: [marketId, version, closedAt]
+              properties:
+                marketId:
+                  type: string
+                  format: uuid
+                version:
+                  type: integer
+                  minimum: 1
+                closedAt:
+                  type: string
+                  format: date-time
+    MarketResolvedEvent:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.markets.MarketResolved.v1
+            data:
+              type: object
+              required: [marketId, outcome, version, resolvedAt]
+              properties:
+                marketId:
+                  type: string
+                  format: uuid
+                outcome:
+                  type: string
+                  enum: ['YES', 'NO', 'INVALID']
+                version:
+                  type: integer
+                  minimum: 1
+                resolvedAt:
+                  type: string
+                  format: date-time
+    TradeExecutedEvent:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            type:
+              const: si.chance.trading.TradeExecuted.v1
+            data:
+              type: object
+              required: [marketId, yesPriceMicro, costMicro, tradeSequence, executedAt]
+              properties:
+                marketId:
+                  type: string
+                  format: uuid
+                yesPriceMicro:
+                  type: integer
+                  minimum: 10000
+                  maximum: 990000
+                  description: The trade's price as the price of YES (price_yes of the price point); any integer of the range, as trading's contract allows (its levels are on the 10000 grid today)
+                costMicro:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                  description: Microcredits the trade moved (the volume of the price point); for a sale (trading's kind sale, UC-08) the cost of the other side's shares it bought, as for any buy
+                tradeSequence:
+                  type: integer
+                  minimum: 1
+                  description: The market's trade sequence after this trade (1, 2, 3 ... without gaps); unique per market
+                executedAt:
+                  type: string
+                  format: date-time

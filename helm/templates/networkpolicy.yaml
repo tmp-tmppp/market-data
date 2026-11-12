@@ -1,0 +1,83 @@
+{{- if .Values.networkPolicy.enabled }}
+# Ingress: the port (http) admits only the API gateway, and the smoke test Pod of this release; the metrics port
+# (metrics) admits only the monitoring namespace (networkPolicy.metrics.namespace). The sources are Pods of this
+# namespace (the monitoring namespace as a whole). market-data has no internal API, so no other service is admitted.
+# Egress: PostgreSQL, NATS (three consumers, no publisher), the identity provider (the signing keys of the tokens) and
+# DNS; everything else is denied (market-data calls no other service). The policy selects the service's Pods only, not
+# the smoke test Pod, which carries the same selector labels but must reach the Service. A replay or backfill started
+# with "kubectl exec" runs inside the service's Pod and needs only PostgreSQL, which the policy allows.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "market-data.fullname" . }}
+  labels:
+    {{- include "market-data.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "market-data.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["smoke-test"]
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The public API and the health probes.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayNamespaceLabels | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayPodLabels | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: smoke-test
+      ports:
+        - port: http
+          protocol: TCP
+    # The metrics port: the monitoring namespace (networkPolicy.metrics.namespace) only; it scrapes nothing else.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.metrics.namespace | quote }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  egress:
+    # PostgreSQL: the service's database on the shared server (DM-01).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.postgres.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.postgres.port }}
+          protocol: TCP
+    # NATS: the three consumers read the streams TENANTS, MARKETS and TRADING.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.nats.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.nats.port }}
+          protocol: TCP
+    # The identity provider: the signing keys of the tokens (market-data asks it for nothing else).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.keycloak.podLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.networkPolicy.egress.keycloak.port }}
+          protocol: TCP
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.egress.dnsNamespaceLabels | nindent 14 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}

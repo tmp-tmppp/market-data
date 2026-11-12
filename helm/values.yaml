@@ -1,0 +1,135 @@
+# Defaults, safe for a local cluster. values-dev.yaml and values-prod.yaml override them; the pipeline sets
+# image.repository and image.tag (sha-<commit>) with --set-string and never puts secrets into values.
+
+image:
+  repository: docker.io/example/market-data
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# One port, one Service: the public API and the health probes (the gateway routes /v1/market-data to this port).
+# market-data has no internal API and calls no other service.
+service:
+  port: 8080
+
+# Metrics (REQ-20): GET /metrics is served on a port of its own, never on service.port, so that the gateway can never
+# route it. The port is rendered as METRICS_PORT and as the container port "metrics"; the Pod annotations
+# prometheus.io/scrape, prometheus.io/port and prometheus.io/path tell Prometheus where to scrape. The Service does not
+# expose it.
+metrics:
+  port: 9464
+
+# Pod annotations (the prometheus.io ones come from metrics.port); the pipeline adds checksum/app-env so the Pods restart when the Secret changes.
+podAnnotations: {}
+
+# Secret settings (DATABASE_URL) come from this Secret as environment variables.
+# The pipeline creates it from the organization secret MARKET_DATA_ENV; it is optional so the chart renders without it.
+existingSecret: market-data-env
+
+# Non-secret startup settings, rendered into a ConfigMap (all values are strings). Changing one restarts the Pods,
+# because the environment is read only at start. Every key is described in README.md. PORT and RUNTIME_CONFIG_FILE are
+# rendered by the chart from service and the volume mount, and the three runtime keys have their own block below. The
+# schema refuses all of them here, so one value never has two sources.
+env:
+  APP_ENV: production
+  NATS_URL: nats://nats:4222
+  AUTH_JWKS_URL: http://identity:8080/realms/chance/protocol/openid-connect/certs
+  AUTH_ISSUER: http://localhost:8081/realms/chance
+  AUTH_AUDIENCE: chance
+  AUTH_ROLES_CLAIM: realm_access.roles
+  AUTH_TENANT_CLAIM: organization
+  DATABASE_POOL_MAX: "5"
+  RUNTIME_CONFIG_POLL_MS: "10000"
+  # Drain after SIGTERM: readiness answers 503 and the Pod keeps serving for this long before it closes. It has to fit
+  # into terminationGracePeriodSeconds (30 in the Deployment) together with the 10 seconds a close may take.
+  SHUTDOWN_DELAY_MS: "5000"
+  # The GraphQL endpoint (POST /v1/market-data/graphql, README "GraphQL"). Introspection stays off in a cluster: the schema
+  # is published as contracts/graphql/schema.graphql. A query deeper than GRAPHQL_MAX_DEPTH (1 to 10) or costing more than
+  # GRAPHQL_MAX_COMPLEXITY (10 to 100000) is refused before it runs.
+  GRAPHQL_INTROSPECTION: "false"
+  GRAPHQL_MAX_DEPTH: "5"
+  GRAPHQL_MAX_COMPLEXITY: "5000"
+
+# Runtime configuration (ADR-037): the keys the service applies while it runs, without a restart. They are rendered
+# into the ConfigMap <release>-runtime, which the Pods mount as the directory /etc/market-data/runtime (never as a
+# subPath, which would never update). The Pods do NOT restart when it changes: the kubelet refreshes the mounted file
+# within about a minute and the service reads it again every RUNTIME_CONFIG_POLL_MS. A key left out here keeps the
+# service's default (a deleted line undoes an override); the bounds are checked by the service, which keeps the value in
+# force for a key whose value is invalid (a typo in the ConfigMap never undoes a pause) and logs it.
+runtime:
+  LOG_LEVEL: info
+  # The most buckets one history request may span (10 to 10000); a wider range answers 400 with maxPoints.
+  HISTORY_MAX_POINTS: "1000"
+  # "false" pauses the price history (503 history_paused) while the market list and the detail keep working, for
+  # example to take load off the database during a rebuild.
+  HISTORY_ENABLED: "true"
+
+# The limit is 384Mi, not 256Mi as in the services that run one process: the projection rebuild (README: "The replay
+# demo", ADR-058) and the backfill run as a second Node process inside the container and share this limit with the
+# server, and an out-of-memory kill would take the API and the consumers down with it. The rebuild caps its own heap
+# (node --max-old-space-size=96) and reads at most 1000 rows per batch. The schema keeps a limit of at least 384Mi and a
+# request of at least 128Mi, so a smaller value fails the chart check and not the demo.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi
+
+#
+# timeoutSeconds: the readiness handler runs SELECT 1 on the same connection pool as the requests and may wait up to 3
+# seconds for a free connection (the pool's connectionTimeoutMillis), so its timeout is 4, not the kubelet's 1: under a
+# burst of history requests a busy Pod must not leave the Service endpoints only because the probe queued behind them.
+# Keep it below periodSeconds. Startup and liveness do not touch the database; 1 is the kubelet's default.
+probes:
+  startup:
+    path: /health/startup
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  readiness:
+    path: /health/ready
+    periodSeconds: 10
+    timeoutSeconds: 4
+    failureThreshold: 3
+  liveness:
+    path: /health/live
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
+
+# The port admits only the API gateway (and the smoke test of this release). The Pods reach only what they need:
+# PostgreSQL, NATS, the identity provider (signing keys) and DNS; market-data calls no other service.
+# Needs a network policy engine in the cluster (plan section 9). The sources and destinations are Pods of the
+# release's own namespace, selected by the labels below: check them against the Pods of the gateway and the shared
+# PostgreSQL, NATS and identity before enabling it, because a wrong label blocks the service. A managed
+# PostgreSQL outside the cluster would need an ipBlock rule instead.
+networkPolicy:
+  enabled: false
+  gatewayNamespaceLabels:
+    kubernetes.io/metadata.name: gateway
+  gatewayPodLabels:
+    app.kubernetes.io/name: traefik
+  # The namespace of Prometheus (selected by its kubernetes.io/metadata.name label): admitted on the metrics port only.
+  metrics:
+    namespace: monitoring
+  egress:
+    postgres:
+      podLabels:
+        app.kubernetes.io/name: postgres
+      port: 5432
+    nats:
+      podLabels:
+        app.kubernetes.io/name: nats
+      port: 4222
+    keycloak:
+      podLabels:
+        app.kubernetes.io/name: identity
+      port: 8080
+    dnsNamespaceLabels:
+      kubernetes.io/metadata.name: kube-system
+
+# Smoke test run by "helm test" after every deploy: asks the readiness endpoint through the Service.
+smokeTest:
+  image: docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
